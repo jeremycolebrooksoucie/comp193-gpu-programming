@@ -1,0 +1,284 @@
+/**************************************************************************
+*
+*           COMP 193
+*           GPU programming 
+*           Exercise 2 template 
+*
+**************************************************************************/
+#include <math.h>
+#include <cuda.h>
+//#include <curand.h>                 // includes random num stuff
+//#include <curand_kernel.h>       	// more rand stuff
+//#include <cuda_texture_types.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "gpu_main.h"
+#include "params.h"
+
+// define texture memory
+texture<float, 2> texGray;
+texture<float, 2> texRed;
+texture<float, 2> texGreen;
+texture<float, 2> texBlue;
+
+/*************************************************************************/
+int spreadColor(GPU_Palette* P){
+
+  //dev_spreadColor<<< P->gBlocks, P->gThreads >>>(P-> red, P->green, P->blue);
+  
+  return 0;
+}
+
+int reduceToEdges(GPU_Palette* P){
+
+  dev_reduceToEdges<<< P->gBlocks, P->gThreads >>>(P->gray);
+  
+  return 0;
+}
+
+int colorAroundEdges(GPU_Palette* P){
+
+  //dev_colorAroundEdges<<< P->gBlocks, P->gThreads >>>(P-> red, P->green, P->blue, P->gray);
+  
+  return 0;
+}
+
+
+/*************************************************************************/
+__global__ void dev_colorAroundEdges(float* red, float* green, float* blue, float* gray)
+{
+    int x = threadIdx.x + (blockIdx.x * blockDim.x);
+    int y = threadIdx.y + (blockIdx.y * blockDim.y);
+    int vecIdx = x + (y * blockDim.x * gridDim.x);
+
+    if(tex2D(texGray, x, y) == 1){
+        red[vecIdx] = 1;
+        green[vecIdx] = 1;
+        blue[vecIdx] = 1;
+    }
+    else if (tex2D(texGray, x + 1, y) == 1 || tex2D(texGray, x - 1, y) == 1 ||
+             tex2D(texGray, x, y + 1) == 1 ||tex2D(texGray, x , y - 1) == 1)
+    {
+        /* if adjacent to an edge, leave original color */
+
+    }
+    else
+    {
+        red[vecIdx] = 0;
+        green[vecIdx] = 0;
+        blue[vecIdx] = 0;
+
+        //printf("edge found! at {%d %d} with {%f %f %f}/{%f %f %f} \n", x, y, 
+        //                                 red[vecIdx], green[vecIdx], blue[vecIdx], 
+        //                                 tex2D(texRed, x, y), tex2D(texGreen, x, y), tex2D(texBlue, x, y));
+
+    }
+}
+
+
+/*************************************************************************/
+__global__ void dev_spreadColor(float* red, float* green, float* blue)
+{
+    int x = threadIdx.x + (blockIdx.x * blockDim.x);
+    int y = threadIdx.y + (blockIdx.y * blockDim.y);
+    int vecIdx = x + (y * blockDim.x * gridDim.x);
+
+    float r, g, b;
+    r = tex2D(texRed, x, y);
+    g = tex2D(texGreen, x, y);
+    b = tex2D(texBlue, x, y);
+
+    float spreadCutoff = 0.4;
+    if (r < spreadCutoff & g < spreadCutoff & b < spreadCutoff) {
+        int count = 0;
+        float accR = 0;
+        float accG = 0;
+        float accB = 0;
+
+        for (int i = -1; i <= 1; i++)
+            for (int j = -1; j <= 1; j++) {
+                float r2, g2, b2;
+                if ((r2 = tex2D(texRed, x + i, y + j)) != 0 | 
+                    (g2 = tex2D(texGreen, x + i, y + j)) != 0 |
+                    (b2 = tex2D(texBlue, x + i, y + j)) != 0) {
+                    if (r2 != 1 || b2 != 1 || g2 != 1) {
+                        accR += r2;
+                        accG += g2;
+                        accB += b2;
+                        count++;
+                    }
+                }
+            }
+        /* note that ++count prevents div 0 errors
+           and allows for slight fading coming away from edges */
+        if (count != 0) {
+            red[vecIdx] = accR/count;
+            green[vecIdx] = accG/count;
+            blue[vecIdx] = accB/count;
+        }
+
+    }
+}
+/*************************************************************************/
+/*
+ *  updates gray to be all only edges, edges are white, default is black
+ */
+__global__ void dev_reduceToEdges(float* gray)
+{
+    int x = threadIdx.x + (blockIdx.x * blockDim.x);
+    int y = threadIdx.y + (blockIdx.y * blockDim.y);
+    int vecIdx = x + (y * blockDim.x * gridDim.x);
+
+    /* partial derivitives in terms of x, y, and {r, g, b} */
+    float dry, dgy, dby, drx, dgx, dbx;
+    dry = partial_diff('y', 'r', x, y);
+    dgy = partial_diff('y', 'g', x, y);
+    dby = partial_diff('y', 'b', x, y);
+    drx = partial_diff('x', 'r', x, y);
+    dgx = partial_diff('x', 'g', x, y);
+    dbx = partial_diff('x', 'b', x, y);
+
+    /* use dot products to determine how much 
+       change is happening in a given direction at a pixel */
+    float gxx, gyy, gxy;
+    gxx = drx * drx + dgx * dgx + dbx * dbx;
+    gyy = dry * dry + dgy * dgy + dby * dby;
+    gxy = abs(drx * dry) + abs(dgx * dgy) + abs(dbx * dby);
+
+
+    float isEdge;
+    float cutTop = 0.08;
+
+    /* compare each directional metrc to cutoff value obtained through 
+       trial and error */
+    if (gxx > cutTop || gyy > cutTop || gxy > cutTop)
+        isEdge = 1; // edge is white
+    else {
+        isEdge = 0; // default background is black
+    }
+
+
+    gray[vecIdx]   = isEdge;
+}
+
+/*************************************************************************/  
+
+/*
+ * Takes the partial derivitive along axis {'x', 'y'} for 
+ * color {'r', 'g', 'b'} at point (x, y). Partial taken using
+ * five-point stencil method. 
+ */ 
+__device__ float partial_diff(char axis, char color, int x, int y) 
+{
+    float val[5];
+
+    int i = 0;
+    switch (axis) {
+        case 'x': 
+            switch (color) 
+            {
+                case 'r': 
+                    for (i = -2; i <= 2; i++) 
+                        val[i + 2] = tex2D(texRed, x + i, y);
+                    break;
+                case 'g': 
+                    for (i = -2; i <= 2; i++) 
+                        val[i + 2] = tex2D(texGreen, x + i, y); 
+                    break;
+                case 'b': 
+                    for (i = -2; i <= 2; i++) 
+                        val[i + 2] = tex2D(texBlue, x + i, y); 
+                    break;
+                default: printf("err");
+            }
+            break;
+        case 'y':
+            switch (color) {
+                case 'r': 
+                    for (i = -2; i <= 2; i++) 
+                        val[i + 2] = tex2D(texRed, x, y + i);
+                    break;
+                case 'g': 
+                    for (i = -2; i <= 2; i++) 
+                        val[i + 2] = tex2D(texGreen, x, y + i); 
+                    break;
+                case 'b': 
+                    for (i = -2; i <= 2; i++) 
+                        val[i + 2] = tex2D(texBlue, x, y + i); 
+                    break;
+                default: printf("err"); 
+            }
+            break;
+        default: printf("err");
+  }
+  float pxy = val[2];
+  float dF = ( -(val[4]) + 8 * (val[3]) - 8 * (val[1]) + (val[0]))/12;
+  return dF;
+}
+
+
+
+/*************************************************************************/
+GPU_Palette initGPUPalette(AParams* PARAMS){
+
+  // load
+  GPU_Palette P;
+  
+  P.gTPB = THREADS_PER_BLOCK;      // threads per block
+  //P.gDIM = 800;     // assumes the image is 800x800
+  P.gWidth = PARAMS->width;
+  P.gHeight = PARAMS->height;
+
+
+  // 800x800 palette = 25x25 grid of 32x32 threadblocks
+  P.gSize = P.gWidth * P.gHeight * sizeof(float);
+  
+  
+  P.gThreads.x = P.gTPB;
+  P.gThreads.y = P.gTPB;
+  P.gThreads.z = 1;         // 3D of threads allowed
+  P.gBlocks.x = (P.gWidth  + P.gTPB - 1)/P.gTPB;
+  P.gBlocks.y = (P.gHeight + P.gTPB - 1)/P.gTPB;
+  P.gBlocks.z = 1;          // only 2D of blocks allowed
+
+  // allocate memory for the palette
+  cudaMalloc((void**) &P.gray, P.gSize);    // black and white (avg of rgb)
+  cudaMalloc((void**) &P.red, P.gSize);   // r
+  cudaMalloc((void**) &P.green, P.gSize); // g
+  cudaMalloc((void**) &P.blue, P.gSize);  // b
+    
+  // create texture memory and bind to black and white data
+  cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
+//  cudaBindTexture2D(NULL, texGray, P.gray, desc, P.gDIM,
+//                        P.gDIM, sizeof(float) * P.gDIM);
+
+  cudaBindTexture2D(NULL, texBlue, P.blue, desc, P.gWidth,
+                        P.gHeight, sizeof(float) * P.gWidth);
+  cudaBindTexture2D(NULL, texGreen, P.green, desc, P.gWidth,
+                        P.gHeight, sizeof(float) * P.gWidth);
+  cudaBindTexture2D(NULL, texRed, P.red, desc, P.gWidth,
+                        P.gHeight, sizeof(float) * P.gWidth);   
+  cudaBindTexture2D(NULL, texGray, P.gray, desc, P.gWidth,
+                        P.gHeight, sizeof(float) * P.gWidth);                                              
+  return P;
+}
+
+
+/*************************************************************************/
+int freeGPUPalette(GPU_Palette* P) {
+
+  // free texture memory
+//  cudaUnbindTexture(texGray); // this is bound to black and white
+ // cudaUnbindTexture(texBlue); // this is bound to black and white
+  
+  // free gpu memory
+  cudaFree(P->gray);
+  cudaFree(P->red);  
+  cudaFree(P->green);
+  cudaFree(P->blue);  
+  
+  return 0;
+}
+
+/*************************************************************************/
